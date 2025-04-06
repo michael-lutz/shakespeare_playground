@@ -1,4 +1,4 @@
-# CS182 Shakespeare
+# Shakespeare Playground
 
 This repository contains code for training a character-level language model to generate Shakespearean text.
 
