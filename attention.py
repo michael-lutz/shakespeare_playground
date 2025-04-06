@@ -225,8 +225,10 @@ class AttentionBlock(eqx.Module):
 
 
 class Transformer(eqx.Module, ABC):
+    vocab_size: int = eqx.static_field()
     hidden_size: int = eqx.static_field()
     max_context_length: int = eqx.static_field()
+    use_start_token: bool = eqx.static_field()
     vocab_embedding: eqx.nn.Embedding
     output_layer: eqx.nn.Linear
     blocks: list[AttentionBlock]
@@ -239,12 +241,21 @@ class Transformer(eqx.Module, ABC):
         num_heads: int,
         max_context_length: int,
         use_rotary_embeddings: bool,
+        use_start_token: bool,
         key: PRNGKeyArray,
     ):
         self.hidden_size = hidden_size
         self.max_context_length = max_context_length
         keys = jax.random.split(key, num_layers + 2)
-        self.vocab_embedding = eqx.nn.Embedding(vocab_size, hidden_size, key=keys[0])
+
+        self.vocab_size = vocab_size
+        self.use_start_token = use_start_token
+        if self.use_start_token:
+            # We can assume that the start token is the last token in the vocabulary.
+            self.vocab_embedding = eqx.nn.Embedding(vocab_size + 1, hidden_size, key=keys[0])
+        else:
+            self.vocab_embedding = eqx.nn.Embedding(vocab_size, hidden_size, key=keys[0])
+
         self.blocks = [
             AttentionBlock(hidden_size, num_heads, use_rotary_embeddings, key=keys[i + 1]) for i in range(num_layers)
         ]
@@ -272,12 +283,29 @@ class Transformer(eqx.Module, ABC):
         return x, new_kv_caches
 
     def predict_sequence(self, x_seq: Array) -> Array:
+        chex.assert_rank(x_seq, 1) # [T]
+
+        if self.use_start_token:
+            # self.vocab_size is the index of the start token.
+            start_token = jnp.array([self.vocab_size])
+            x_seq = jnp.concatenate([start_token, x_seq], axis=-1)
+
         x_seq = jax.vmap(self.vocab_embedding)(x_seq)
         x_seq += self.input_pos_embedding(x_seq.shape[0], offset=0)
-        y, _ = self.forward_sequence(x_seq, None)
-        return jax.vmap(self.output_layer)(y)
+        x_emb, _ = self.forward_sequence(x_seq, None)
+        y = jax.vmap(self.output_layer)(x_emb)
+
+        if self.use_start_token:
+            return y[1:]
+        else:
+            return y
 
     def generate_sequence(self, prompt_seq: Array, max_len: int) -> Array:
+        chex.assert_rank(prompt_seq, 1) # [T]
+        if self.use_start_token:
+            start_token = jnp.array([self.vocab_size])
+            prompt_seq = jnp.concatenate([start_token, prompt_seq], axis=-1)
+
         x_prompt = jax.vmap(self.vocab_embedding)(prompt_seq)
         x_prompt += self.input_pos_embedding(x_prompt.shape[0], offset=0)
         x_emb, kv_caches = self.forward_sequence(x_prompt, None)
@@ -294,7 +322,8 @@ class Transformer(eqx.Module, ABC):
             predicted_token = jnp.argmax(self.output_layer(x_emb[-1]), axis=-1)
             predicted_tokens.append(predicted_token)
 
-        return jnp.array(predicted_tokens)
+        prompt_length = prompt_seq.shape[0]
+        return jnp.array(predicted_tokens)[prompt_length:]
 
 
 class TransformerNoPE(Transformer):
@@ -305,9 +334,19 @@ class TransformerNoPE(Transformer):
         num_layers: int,
         num_heads: int,
         max_context_length: int,
+        use_start_token: bool,
         key: PRNGKeyArray,
     ):
-        super().__init__(vocab_size, hidden_size, num_layers, num_heads, max_context_length, False, key)
+        super().__init__(
+            vocab_size,
+            hidden_size,
+            num_layers,
+            num_heads,
+            max_context_length,
+            False,
+            use_start_token,
+            key,
+        )
 
     def input_pos_embedding(self, seq_len: int, offset: int) -> Array:
         return jnp.zeros((seq_len, self.hidden_size))
@@ -321,9 +360,19 @@ class TransformerSinusoidalPE(Transformer):
         num_layers: int,
         num_heads: int,
         max_context_length: int,
+        use_start_token: bool,
         key: PRNGKeyArray,
     ):
-        super().__init__(vocab_size, hidden_size, num_layers, num_heads, max_context_length, False, key)
+        super().__init__(
+            vocab_size,
+            hidden_size,
+            num_layers,
+            num_heads,
+            max_context_length,
+            False,
+            use_start_token,
+            key,
+        )
 
     def input_pos_embedding(self, seq_len: int, offset: int) -> Array:
         return sinusoidal_pos_emb(seq_len, self.hidden_size, offset)
@@ -339,9 +388,19 @@ class TransformerLearnedPE(Transformer):
         num_layers: int,
         num_heads: int,
         max_context_length: int,
+        use_start_token: bool,
         key: PRNGKeyArray,
     ):
-        super().__init__(vocab_size, hidden_size, num_layers, num_heads, max_context_length, False, key)
+        super().__init__(
+            vocab_size,
+            hidden_size,
+            num_layers,
+            num_heads,
+            max_context_length,
+            False,
+            use_start_token,
+            key,
+        )
         self.pe = eqx.nn.Embedding(max_context_length, hidden_size, key=key)
 
     def input_pos_embedding(self, seq_len: int, offset: int) -> Array:
@@ -355,9 +414,10 @@ class TransformerRotaryPE(Transformer):
         num_layers: int,
         num_heads: int,
         max_context_length: int,
+        use_start_token: bool,
         key: PRNGKeyArray,
     ):
-        super().__init__(vocab_size, hidden_size, num_layers, num_heads, max_context_length, True, key)
+        super().__init__(vocab_size, hidden_size, num_layers, num_heads, max_context_length, True, use_start_token, key)
 
     def input_pos_embedding(self, seq_len: int, offset: int) -> jnp.ndarray:
         # In rotary embeddings, the position information is injected inside attention.

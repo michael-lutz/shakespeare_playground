@@ -10,12 +10,14 @@ import optax
 import tensorflow_datasets as tfds
 from jaxtyping import Array, PRNGKeyArray, PyTree
 
-from cs182_shakespeare.model.attention import (
+from attention import (
     TransformerLearnedPE,
     TransformerNoPE,
     TransformerRotaryPE,
     TransformerSinusoidalPE,
 )
+from rnn import LSTM, RNN
+from ssm import SSM
 import xax
 
 
@@ -65,6 +67,7 @@ class Config(xax.Config):
     model_type: str = xax.field("lstm", help="The model to use")
     # Transformer-specific fields
     position_embedding_type: str = xax.field("rope", help="The type of transformer to use (if applicable)")
+    use_start_token: bool = xax.field(True, help="Whether to use a start token (if applicable)")
     num_heads: int = xax.field(1, help="The number of attention heads to use (if applicable)")
 
 
@@ -73,70 +76,6 @@ class SequenceModel(Protocol):
 
     def generate_sequence(self, prompt_seq: Array, max_len: int) -> Array: ...
 
-
-class RNN(eqx.Module):
-    vocab_embedding: eqx.nn.Embedding
-    rnn_cells: list[eqx.nn.GRUCell]
-    output_layer: eqx.nn.Linear
-
-    def __init__(
-        self,
-        key: PRNGKeyArray,
-        vocab_size: int,
-        hidden_size: int,
-        num_layers: int,
-    ) -> None:
-        vocab_key, rnn_key = jax.random.split(key, 2)
-        self.vocab_embedding = eqx.nn.Embedding(vocab_size, hidden_size, key=vocab_key)
-        keys = jax.random.split(rnn_key, num_layers)
-        self.rnn_cells = [
-            eqx.nn.GRUCell(input_size=hidden_size, hidden_size=hidden_size, key=keys[i]) for i in range(num_layers)
-        ]
-        self.output_layer = eqx.nn.Linear(hidden_size, vocab_size, key=keys[-1])
-
-    def __call__(self, hs: list[Array], x: Array) -> tuple[list[Array], Array]:
-        new_hs = []
-        for i, rnn_cell in enumerate(self.rnn_cells):
-            h = rnn_cell(x, hs[i])
-            new_hs.append(h)
-            x = h  # Pass the output of the current layer as input to the next
-        y = self.output_layer(x)
-        return new_hs, y
-
-    def predict_sequence(self, x_seq: Array) -> Array:
-        hs = [jnp.zeros(cell.hidden_size) for cell in self.rnn_cells]
-        x_seq = jax.vmap(self.vocab_embedding)(x_seq)
-
-        def step(hs: list[Array], x: Array) -> tuple[list[Array], Array]:
-            hs, y = self(hs, x)
-            return hs, y
-
-        _, y_seq = jax.lax.scan(step, hs, x_seq)
-        return y_seq
-
-    def generate_sequence(self, prompt_seq: Array, max_len: int) -> Array:
-        hs = [jnp.zeros(cell.hidden_size) for cell in self.rnn_cells]
-        prompt_seq_embedded = jax.vmap(self.vocab_embedding)(prompt_seq)
-
-        def encode_step(hs: list[Array], x: Array) -> tuple[list[Array], Array]:
-            hs, y = self(hs, x)
-            return hs, y
-
-        def decode_step(
-            carry: tuple[list[Array], Array, PRNGKeyArray],
-            _: None,
-        ) -> tuple[tuple[list[Array], Array, PRNGKeyArray], Array]:
-            hs, last_token, rng = carry
-            token_embedded = self.vocab_embedding(last_token)
-            hs, y = self(hs, token_embedded)
-            token = jax.random.categorical(rng, y)
-            rng = jax.random.split(rng)[0]
-            return (hs, token, rng), token
-
-        hs, _ = jax.lax.scan(encode_step, hs, prompt_seq_embedded)
-        _, sequence = jax.lax.scan(decode_step, (hs, prompt_seq[-1], jax.random.PRNGKey(0)), None, length=max_len)
-
-        return sequence
 
 class ShakespearePrediction(xax.Task[Config]):
     def __init__(self, config: Config) -> None:
@@ -177,10 +116,9 @@ class ShakespearePrediction(xax.Task[Config]):
                     key=key,
                 )
             case "ssm":
-                return xax.SSM(
-                    input_size=self.config.vocab_size,
+                return SSM(
+                    vocab_size=self.config.vocab_size,
                     hidden_size=self.config.hidden_size,
-                    output_size=self.config.vocab_size,
                     num_layers=self.config.num_layers,
                     block_type="diagonal",
                     skip_connections=True,
@@ -196,6 +134,7 @@ class ShakespearePrediction(xax.Task[Config]):
                             num_layers=self.config.num_layers,
                             num_heads=self.config.num_heads,
                             max_context_length=self.config.max_context_length,
+                            use_start_token=self.config.use_start_token,
                             key=key,
                         )
                     case "nope":
@@ -205,6 +144,7 @@ class ShakespearePrediction(xax.Task[Config]):
                             num_layers=self.config.num_layers,
                             num_heads=self.config.num_heads,
                             max_context_length=self.config.max_context_length,
+                            use_start_token=self.config.use_start_token,
                             key=key,
                         )
                     case "learned_additive":
@@ -214,6 +154,7 @@ class ShakespearePrediction(xax.Task[Config]):
                             num_layers=self.config.num_layers,
                             num_heads=self.config.num_heads,
                             max_context_length=self.config.max_context_length,
+                            use_start_token=self.config.use_start_token,
                             key=key,
                         )
                     case "sine_additive":
@@ -223,6 +164,7 @@ class ShakespearePrediction(xax.Task[Config]):
                             num_layers=self.config.num_layers,
                             num_heads=self.config.num_heads,
                             max_context_length=self.config.max_context_length,
+                            use_start_token=self.config.use_start_token,
                             key=key,
                         )
                     case _:
@@ -297,5 +239,5 @@ class ShakespearePrediction(xax.Task[Config]):
 
 if __name__ == "__main__":
     # Launch the training task.
-    #   python -m train.py model_type=transformer position_embedding_type=rope
+    #   python -m train model_type=transformer position_embedding_type=rope use_start_token=False
     ShakespearePrediction.launch(Config())
