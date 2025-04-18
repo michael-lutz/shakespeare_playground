@@ -161,7 +161,7 @@ class DiscreteDiagSSMBlock(DiagSSMBlock):
         hidden_size: int,
         *,
         key: PRNGKeyArray,
-        init_delta: float = 1.0,
+        init_delta: float = 0.1,
         init_scale: float = 10.0,
     ) -> None:
         super().__init__(hidden_size, key=key)
@@ -184,6 +184,60 @@ class DiscreteDiagSSMBlock(DiagSSMBlock):
         return b_discrete
 
 
+class DPLRSSMBlock(BaseSSMBlock):
+    a_diag: Array
+    p_vec: Array
+    q_vec: Array
+    b_mat: Array
+
+    def __init__(
+        self,
+        hidden_size: int,
+        *,
+        key: PRNGKeyArray,
+        rank: int = 1,
+    ) -> None:
+        k1, k2, k3, k4 = jax.random.split(key, 4)
+        self.a_diag = glorot(k1, (hidden_size,))
+        self.p_vec = glorot(k2, (hidden_size, rank))
+        self.q_vec = glorot(k3, (hidden_size, rank))
+        self.b_mat = glorot(k4, (hidden_size, hidden_size))
+
+    def get_a_mat(self, x: Array) -> Array:
+        """Construct discretized A matrix: diag(a_diag) + P Q^T, exponentiated."""
+        a_mat = jnp.diag(self.a_diag) + self.p_vec @ self.q_vec.T
+        # A_disc = jax.scipy.linalg.expm(self.delta * A)
+        # return A_disc
+        return a_mat
+
+    def get_b_mat(self, x: Array) -> Array:
+        """Discretize B using: ∫ exp(A τ) dτ B ≈ A^{-1}(exp(A Δ) - I) B"""
+        # a_mat = jnp.diag(self.a_diag) + self.p_vec @ self.q_vec.T
+        # exp_a_mat = jax.scipy.linalg.expm(self.delta * a_mat)
+        # a_mat_inv = jnp.linalg.pinv(a_mat)
+        # b_mat_disc = a_mat_inv @ (exp_a_mat - jnp.eye(a_mat.shape[0])) @ self.b_mat
+        # return b_mat_disc
+        return self.b_mat
+
+    def forward(self, h: Array, x: Array) -> Array:
+        """Performs a single forward pass."""
+        A = self.get_a_mat(x)
+        B = self.get_b_mat(x)
+        return A @ h + B @ x
+
+    def forward_sequence(self, x_seq: Array) -> Array:
+        """Performs a forward pass across time."""
+
+        def step(h: Array, x: Array) -> tuple[Array, Array]:
+            h = self.forward(h, x)
+            return h, h
+
+        a_mat = self.get_a_mat(x_seq)
+        h_0 = jnp.zeros(a_mat.shape[0])
+        _, h_seq = jax.lax.scan(step, h_0, x_seq)
+        return h_seq
+
+
 class SSM(eqx.Module):
     vocab_embedding: eqx.nn.Embedding
     output_layer: eqx.nn.Linear
@@ -197,11 +251,14 @@ class SSM(eqx.Module):
         vocab_size: int,
         hidden_size: int,
         num_layers: int,
-        block_type: Literal["diagonal", "full_rank"] = "full_rank",
+        block_type: Literal["diagonal", "full_rank", "dplr"] = "full_rank",
         skip_connections: bool = False,
         discretize: bool = False,
         *,
         key: PRNGKeyArray,
+        disc_init_delta: float = 0.1,
+        disc_init_scale: float = 10.0,
+        dplr_rank: int = 1,
     ) -> None:
         vocab_key, s4_key = jax.random.split(key, 2)
         self.vocab_embedding = eqx.nn.Embedding(vocab_size, hidden_size, key=vocab_key)
@@ -214,7 +271,9 @@ class SSM(eqx.Module):
             match block_type:
                 case "diagonal":
                     return (
-                        DiscreteDiagSSMBlock(hidden_size, key=key, init_delta=0.1)
+                        DiscreteDiagSSMBlock(
+                            hidden_size, key=key, init_delta=disc_init_delta, init_scale=disc_init_scale
+                        )
                         if discretize
                         else DiagSSMBlock(hidden_size, key=key)
                     )
@@ -222,6 +281,10 @@ class SSM(eqx.Module):
                     if discretize:
                         raise ValueError("Full rank blocks do not support discretization due to instability.")
                     return SSMBlock(hidden_size, key=key)
+                case "dplr":
+                    if discretize:
+                        raise ValueError("DPLR blocks do not support discretization yet.")
+                    return DPLRSSMBlock(hidden_size, rank=dplr_rank, key=key)
                 case _:
                     raise ValueError(f"Unknown block type: {block_type}")
 
@@ -243,7 +306,7 @@ class SSM(eqx.Module):
 
     def predict_sequence(self, x_seq: Array) -> Array:
         """Predicts an entire sequence of tokens at once."""
-        x_emb = self.vocab_embedding(x_seq)
+        x_emb = jax.vmap(self.vocab_embedding)(x_seq)
         for block in self.blocks:
             h = block.forward_sequence(x_emb)
             # h = block.naive_forward_sequence(x_emb)
@@ -255,7 +318,7 @@ class SSM(eqx.Module):
     def generate_sequence(self, prompt_seq: Array, max_len: int) -> Array:
         """Autoregressively generates a sequence of tokens."""
         hs = [jnp.zeros(self.hidden_size) for _ in range(self.num_layers)]
-        prompt_seq_embedded = self.vocab_embedding(prompt_seq)
+        prompt_seq_embedded = jax.vmap(self.vocab_embedding)(prompt_seq)
 
         def encode_step(hs: list[Array], x: Array) -> tuple[list[Array], Array]:
             hs, y = self(hs, x)

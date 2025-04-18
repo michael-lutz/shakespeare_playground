@@ -1,7 +1,7 @@
 """Core training code for Shakespeare character-level language models."""
 
 from dataclasses import dataclass
-from typing import Iterator, Protocol
+from typing import Iterator, Literal, Protocol, cast, get_args
 
 import equinox as eqx
 import jax
@@ -69,6 +69,10 @@ class Config(xax.Config):
     position_embedding_type: str = xax.field("rope", help="The type of transformer to use (if applicable)")
     use_start_token: bool = xax.field(True, help="Whether to use a start token (if applicable)")
     num_heads: int = xax.field(1, help="The number of attention heads to use (if applicable)")
+    # SSM-specific fields
+    ssm_type: str = xax.field("full_rank", help="The type of SSM block to use")
+    ssm_discretize: bool = xax.field(False, help="Whether to discretize the SSM blocks")
+    ssm_dplr_rank: int = xax.field(1, help="The rank of the DPLR blocks")
 
 
 class SequenceModel(Protocol):
@@ -116,13 +120,19 @@ class ShakespearePrediction(xax.Task[Config]):
                     key=key,
                 )
             case "ssm":
+                valid_types = get_args(Literal["diagonal", "full_rank", "dplr"])
+                if self.config.ssm_type not in valid_types:
+                    raise ValueError(f"Invalid ssm_type: {self.config.ssm_type}. Must be one of {valid_types}")
+
+                block_type = cast(Literal["diagonal", "full_rank", "dplr"], self.config.ssm_type)
                 return SSM(
                     vocab_size=self.config.vocab_size,
                     hidden_size=self.config.hidden_size,
                     num_layers=self.config.num_layers,
-                    block_type="diagonal",
+                    block_type=block_type,
                     skip_connections=True,
-                    discretize=False,
+                    discretize=self.config.ssm_discretize,
+                    dplr_rank=self.config.ssm_dplr_rank,
                     key=key,
                 )
             case "transformer":
@@ -206,7 +216,7 @@ class ShakespearePrediction(xax.Task[Config]):
         self.logger.log_string("prompt", "".join([self.ds.id_to_token[int(token)] for token in prompt_seq]))
         self.logger.log_string("generated_output", generated_words)
 
-    def get_data_iterator(self, phase: xax.Phase) -> Iterator[tuple[Array, Array]]:
+    def get_data_iterator(self, phase: xax.Phase, key: PRNGKeyArray) -> Iterator[tuple[Array, Array]]:
         """Returns an iterator over batches of tokenized Shakespeare text.
 
         Args:
@@ -225,7 +235,6 @@ class ShakespearePrediction(xax.Task[Config]):
             token_ids = self.token_ids[int(0.95 * len(self.token_ids)) :]
         n_tokens = token_ids.shape[0]
 
-        key = jax.random.PRNGKey(0)
         while True:
             key, subkey = jax.random.split(key)
             # Sample starting indices for each sequence in the batch.
